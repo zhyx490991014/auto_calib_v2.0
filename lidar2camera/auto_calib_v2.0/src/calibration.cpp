@@ -24,7 +24,7 @@ void Create_ColorBar()
         pColor[ba * 3 + 1] = S[s / 13];
         pColor[ba * 3 + 2] = V[v / 13 / 3];
     }
-    cv::cvtColor(color, color_bar, CV_HSV2BGR);
+    cv::cvtColor(color, color_bar, cv::COLOR_HSV2BGR);
 }
 
 Calibrator::Calibrator(const std::string mask_dir,
@@ -62,11 +62,82 @@ Calibrator::Calibrator(const std::string mask_dir,
     // load point cloud
     pcl::PointCloud<pcl::PointXYZI>::Ptr pc_origin(new pcl::PointCloud<pcl::PointXYZI>);
     DataLoader::LoadLidarFile(lidar_file, pc_origin);
+    
+    // 使用八叉树实现降采样，体素滤波尺寸太小会overflow
+    pcl::PointCloud<pcl::PointXYZI>::Ptr pc_downsampled = DownsamplePointCloud(pc_origin, 0.07f);
+    // pcl::PointCloud<pcl::PointXYZI>::Ptr pc_downsampled = pc_origin;
+
     // preprocess point cloud
     std::cout << "----------Start processing data----------" << std::endl;
-    ProcessPointcloud(pc_origin);
+    std::cout << "Original points: " << pc_origin->size() << ", Downsampled points: " << pc_downsampled->size() << std::endl;
+    ProcessPointcloud(pc_downsampled);
 
     Create_ColorBar();
+}
+
+pcl::PointCloud<pcl::PointXYZI>::Ptr Calibrator::DownsamplePointCloud(
+    const pcl::PointCloud<pcl::PointXYZI>::Ptr pc_origin,
+    float leaf_size)
+{
+    pcl::PointCloud<pcl::PointXYZI>::Ptr pc_downsampled(new pcl::PointCloud<pcl::PointXYZI>);
+
+    // 1. 直接用目标 leaf_size 作为八叉树的分辨率
+    pcl::octree::OctreePointCloudSearch<pcl::PointXYZI> octree(leaf_size);
+    octree.setInputCloud(pc_origin);
+    octree.addPointsFromInputCloud();
+
+    // 2. 收集所有非空体素的索引向量指针（避免拷贝）
+    // getPointIndicesVector() 返回 const std::vector<int>&，直接取地址存储
+    std::vector<const std::vector<int>*> all_voxel_indices;
+    size_t leaf_count = octree.getLeafCount();
+
+    std::cout << "Total voxels: " << leaf_count << std::endl;
+
+    all_voxel_indices.reserve(leaf_count);
+    
+    for(auto it = octree.leaf_depth_begin(); it != octree.leaf_depth_end(); ++it)
+    {
+        const std::vector<int>& point_idx_vec = it.getLeafContainer().getPointIndicesVector();
+        if(!point_idx_vec.empty())
+        {
+            all_voxel_indices.push_back(&point_idx_vec);
+        }
+    }
+
+    // 3. 直接 resize 到目标大小，为并行写入做准备
+    size_t valid_voxel_count = all_voxel_indices.size();
+    pc_downsampled->points.resize(valid_voxel_count);
+    
+    // 4. 并行计算每个体素的质心，直接写入 pc_downsampled->points
+    #pragma omp parallel for
+    for(size_t v = 0; v < valid_voxel_count; ++v)
+    {
+        const auto& point_idx_vec = *all_voxel_indices[v];
+        
+        // 计算该体素内的质心 (Centroid)，完美复刻 VoxelGrid 行为
+        double x = 0.0, y = 0.0, z = 0.0, intensity = 0.0;
+        for(int idx : point_idx_vec)
+        {
+            const auto& pt = pc_origin->points[idx];
+            x += pt.x;
+            y += pt.y;
+            z += pt.z;
+            intensity += pt.intensity;
+        }
+
+        size_t n = point_idx_vec.size();
+        pc_downsampled->points[v].x = static_cast<float>(x / n);
+        pc_downsampled->points[v].y = static_cast<float>(y / n);
+        pc_downsampled->points[v].z = static_cast<float>(z / n);
+        pc_downsampled->points[v].intensity = static_cast<float>(intensity / n);
+    }
+    
+    // 5. 设置无序点云的元数据
+    pc_downsampled->width = static_cast<uint32_t>(valid_voxel_count);
+    pc_downsampled->height = 1;
+    pc_downsampled->is_dense = true;
+
+    return pc_downsampled;
 }
 
 void Calibrator::ProcessPointcloud(const pcl::PointCloud<pcl::PointXYZI>::Ptr pc_origin)
@@ -74,12 +145,22 @@ void Calibrator::ProcessPointcloud(const pcl::PointCloud<pcl::PointXYZI>::Ptr pc
     // pre-filter points by initial extrinsic
     pcl::PointCloud<pcl::PointXYZI>::Ptr pc_filtered(new pcl::PointCloud<pcl::PointXYZI>);
     int margin = 300;
-    float intensity_max = 1;
+    float intensity_max = 1.;   //XXX: CARLA点云都在0~1，而且强度只和距离有关，初始值应该使用0还是1？
     // float intensity_mean = 0;
     std::vector<Var6> vars;
     Util::GenVars(1, 5, 1, 0.5, vars);
-    for (const auto src_pt : pc_origin->points)
+    
+    int num_points = pc_origin->points.size();
+
+    // 为每个线程分配独立的局部容器
+    std::vector<pcl::PointXYZI> local_filtered_points[omp_get_max_threads()];
+    float local_intensity_max[omp_get_max_threads()];
+    for(int i = 0; i < omp_get_max_threads(); i++) local_intensity_max[i] = 1.0;
+
+    #pragma omp parallel for
+    for (int i = 0; i < num_points; ++i)
     {
+        const auto& src_pt = pc_origin->points[i];
         if (!std::isfinite(src_pt.x) || !std::isfinite(src_pt.y) ||
             !std::isfinite(src_pt.z))
             continue;
@@ -90,12 +171,17 @@ void Calibrator::ProcessPointcloud(const pcl::PointCloud<pcl::PointXYZI>::Ptr pc
             Eigen::Matrix4f extrinsic = extrinsic_ * Util::GetDeltaT(var.value);
             if (ProjectOnImage(vec, extrinsic, x, y, margin))
             {
-                intensity_max = MAX(intensity_max, src_pt.intensity);
-                // intensity_mean += src_pt.intensity;
-                pc_filtered->points.push_back(src_pt);
+                int tid = omp_get_thread_num(); // 获取线程 ID
+                local_intensity_max[tid] = MAX(local_intensity_max[tid], src_pt.intensity);
+                local_filtered_points[tid].push_back(src_pt);
                 break;
             }
         }
+    }
+
+    for (int i = 0; i < omp_get_max_threads(); i++) {
+        intensity_max = MAX(intensity_max, local_intensity_max[i]);
+        pc_filtered->points.insert(pc_filtered->points.end(), local_filtered_points[i].begin(), local_filtered_points[i].end());
     }
 
     // pc_filtered->height = 1;
@@ -113,9 +199,13 @@ void Calibrator::ProcessPointcloud(const pcl::PointCloud<pcl::PointXYZI>::Ptr pc
     std::vector<pcl::PointIndices> seg_indices;
     Segment_pc(pc_filtered, normals, seg_indices);
 
-    // constuct new type pc
+    // construct new type pc
     pc_.reset(new pcl::PointCloud<PointXYZINS>);
-    for (unsigned i = 0; i < pc_filtered->size(); i++)
+    int filtered_size = pc_filtered->size();
+    pc_->points.resize(filtered_size);
+
+#pragma omp parallel for reduction(max:curvature_max_)
+    for (int i = 0; i < filtered_size; i++)
     {
         PointXYZINS pt;
         pt.x = (*pc_filtered)[i].x;
@@ -130,7 +220,7 @@ void Calibrator::ProcessPointcloud(const pcl::PointCloud<pcl::PointXYZI>::Ptr pc
         curvature_max_ = MAX(curvature_max_, pt.curvature);
         // std::cout << pt.curvature << std::endl;
         pt.segment = -1;
-        pc_->points.push_back(pt);
+        pc_->points[i] = pt;
     }
 
     // curvature_max_ /= 2;
@@ -148,10 +238,11 @@ void Calibrator::Segment_pc(const pcl::PointCloud<pcl::PointXYZI>::Ptr cloud,
                             pcl::PointCloud<pcl::Normal>::Ptr normals,
                             std::vector<pcl::PointIndices> &seg_indices)
 {   
-    // compute_normals
-    pcl::NormalEstimation<pcl::PointXYZI, pcl::Normal> norm_est;
+    // compute_normals using OMP for multi-threading
+    pcl::NormalEstimationOMP<pcl::PointXYZI, pcl::Normal> norm_est;
     pcl::search::KdTree<pcl::PointXYZI>::Ptr tree(
         new pcl::search::KdTree<pcl::PointXYZI>());
+    norm_est.setNumberOfThreads(omp_get_max_threads());
     norm_est.setSearchMethod(tree);
     norm_est.setKSearch(40);
     // norm_est.setRadiusSearch(5);
@@ -216,11 +307,11 @@ void Calibrator::Segment_pc(const pcl::PointCloud<pcl::PointXYZI>::Ptr cloud,
 }
 
 void Calibrator::Calibrate()
-{   
-    VisualProjection(init_extrinsic_, img_file_, "init_proj.png");
-    VisualProjectionSegment(init_extrinsic_, img_file_, "init_proj_seg.png");
-    VisualProjection(extrinsic_, img_file_, "error_proj.png");
-    VisualProjectionSegment(extrinsic_, img_file_, "error_proj_seg.png");
+{
+    VisualProjection(init_extrinsic_, img_file_, "result/init_proj.png");
+    VisualProjectionSegment(init_extrinsic_, img_file_, "result/init_proj_seg.png");
+    VisualProjection(extrinsic_, img_file_, "result/error_proj.png");
+    VisualProjectionSegment(extrinsic_, img_file_, "result/error_proj_seg.png");
 
     std::cout << "----------Start calibration----------" << std::endl;
     if (!CalScore(extrinsic_, max_score_, true))
@@ -229,9 +320,19 @@ void Calibrator::Calibrate()
         exit(1);
     }
     std::cout << "init_score: " << max_score_ << std::endl;
-    BruteForceSearch(10, 0.5, 0, 0, true); //[-5, 5]
-    BruteForceSearch(6, 0.15, 0, 0, true); //[-0.9, 0.9]
-    RandomSearch(5000, 0.1, 0.5, true); //[-0.5, 0.5]
+
+    BruteForceSearch(10, 0.5, 0, 0, true);      // [-5, 5]
+    BruteForceSearch(0, 0, 20, 0.01, true);     // add [-0.2, 0.2]
+    BruteForceSearch(5, 0.1, 0, 0, true);       // [-0.5, 0.5]
+    BruteForceSearch(0, 0, 10, 0.001, true);    // add [-0.01, 0.01]
+
+    // RandomSearch(5000, 0.1, 0.5, true);         // [-0.5, 0.5]
+
+
+    // BruteForceSearch(10, 0.5, 0, 0, true);      // [-5, 5]
+    // BruteForceSearch(6, 0.15, 0, 0, true);      // [-0.9, 0.9]
+    // RandomSearch(5000, 0.1, 0.5, true);         // [-0.5, 0.5]
+
 
     // float var[6] = {-0.3, 0, 0.1, 0, 0, 0};
     // CalScore(extrinsic_* Util::GetDeltaT(var), max_score_, true);
@@ -241,8 +342,8 @@ void Calibrator::Calibrate()
 
     std::cout << "---------------Result---------------" << std::endl;
     PrintCurrentError();
-    VisualProjection(extrinsic_, img_file_, "refined_proj.png");
-    VisualProjectionSegment(extrinsic_, img_file_, "refined_proj_seg.png");
+    VisualProjection(extrinsic_, img_file_, "result/refined_proj.png");
+    VisualProjectionSegment(extrinsic_, img_file_, "result/refined_proj_seg.png");
 }
 
 bool Calibrator::CalScore(Eigen::Matrix4f T, float &score, bool is_coarse)
@@ -281,7 +382,7 @@ bool Calibrator::CalScore(Eigen::Matrix4f T, float &score, bool is_coarse)
                     break;
             }
         }
-    }    
+    }
 
     // calculate consistency
     std::vector<float> normal_sims, intensity_sims, segment_sims;
@@ -294,7 +395,7 @@ bool Calibrator::CalScore(Eigen::Matrix4f T, float &score, bool is_coarse)
             continue;
         int points_on_mask = mask_intensity[i].size();
         if (points_on_mask < 20)
-            continue;     
+            continue;
         float adjust = 1 - 0.5 * pow(points_on_mask, -0.5);
         // float adjust = 1;
 
@@ -365,23 +466,29 @@ bool Calibrator::CalScore(Eigen::Matrix4f T, float &score, bool is_coarse)
     intensity_score = Util::WeightMean(intensity_sims, weight_intensity);
     segment_score = Util::WeightMean(segment_sims, weight_seg);
     score = 0.3 * normal_score + 0.3 * intensity_score + 0.4 * segment_score;
+    // score = 0.3 * normal_score + 0.4 * segment_score;
 
     // std::cout << "score: " << normal_score << " " << intensity_score << " " << segment_score << " " << score << std::endl;
     return true;
 }
 
-void Calibrator::BruteForceSearch(int rpy_range, float rpy_resolution, int xyz_range, float xyz_resolution, bool is_coarse)
+void Calibrator::BruteForceSearch(int rpy_range, float rpy_resolution, int xyz_range, float xyz_resolution, bool is_coarse, const bool is_left_multiply)
 {
     std::cout << "Start brute-force search around [-" << rpy_range * rpy_resolution << ","
-              << rpy_range * rpy_resolution << "] degree and [-" << xyz_range * xyz_resolution 
+              << rpy_range * rpy_resolution << "] degree and [-" << xyz_range * xyz_resolution
               << "," << xyz_range * xyz_resolution << "] m" << std::endl;
     float best_var[6] = {0};
-    float score;
     std::vector<Var6> vars;
     Util::GenVars(rpy_range, rpy_resolution, xyz_range, xyz_resolution, vars);
-    for (auto var : vars)
+    
+    #pragma omp parallel for
+    for (int i = 0; i < (int)vars.size(); ++i)
     {
-        CalScore(extrinsic_ * Util::GetDeltaT(var.value), score, is_coarse);
+        auto var = vars[i];
+        float score;
+        CalScore(is_left_multiply ? Util::GetDeltaT(var.value) * extrinsic_ : extrinsic_ * Util::GetDeltaT(var.value), score, is_coarse);
+
+        #pragma omp critical
         if (score > max_score_)
         {
             max_score_ = score;
@@ -399,51 +506,58 @@ void Calibrator::BruteForceSearch(int rpy_range, float rpy_resolution, int xyz_r
     std::cout << "best var:" << best_var[0] << " " << best_var[1] << " " << best_var[2] << " " << best_var[3] << " "
               << best_var[4] << " " << best_var[5] << std::endl;
     Eigen::Matrix4f deltaT = Util::GetDeltaT(best_var);
-    extrinsic_ *= deltaT;
+    extrinsic_ = is_left_multiply ? deltaT * extrinsic_ : extrinsic_ * deltaT;
 }
 
-void Calibrator::RandomSearch(int search_count, float xyz_range, float rpy_range, bool is_coarse)
+void Calibrator::RandomSearch(int search_count, float xyz_range, float rpy_range, bool is_coarse, const bool is_left_multiply)
 {
     std::cout << "Start random search around [-" << rpy_range << "," << rpy_range << "] degree and [-"
               << xyz_range << "," << xyz_range << "] m" << std::endl;
-    float var[6] = {0};
+
     float bestVal[6] = {0};
 
-    std::default_random_engine generator((clock() - time(0)) /
-                                         (double)CLOCKS_PER_SEC);
-    std::uniform_real_distribution<double> distribution_xyz(-xyz_range, xyz_range);
-    std::uniform_real_distribution<double> distribution_rpy(-rpy_range, rpy_range);
+    // std::default_random_engine generator((clock() - time(0)) / (double)CLOCKS_PER_SEC);  // 随机数生成器不是线程安全的
+    auto seed_base = std::chrono::steady_clock::now().time_since_epoch().count();
 
-    for (int i = 0; i < search_count; i++)
+#pragma omp parallel
     {
-        var[0] = distribution_rpy(generator);
-        var[1] = distribution_rpy(generator);
-        var[2] = distribution_rpy(generator);
-        var[3] = distribution_xyz(generator);
-        var[4] = distribution_xyz(generator);
-        var[5] = distribution_xyz(generator);
-        Eigen::Matrix4f deltaT = Util::GetDeltaT(var);
-        float score;
-        if (!CalScore(extrinsic_ * deltaT, score, is_coarse))
+        // 每个线程有自己的随机数生成器
+        std::default_random_engine generator(seed_base + omp_get_thread_num());  // 用线程 ID 做种子
+        std::uniform_real_distribution<double> distribution_xyz(-xyz_range, xyz_range);
+        std::uniform_real_distribution<double> distribution_rpy(-rpy_range, rpy_range);
+
+        #pragma omp for
+        for(int i = 0; i < search_count; i++)
         {
-            continue;
-        }
-        if (score > max_score_)
-        {
-            max_score_ = score;
-            for (size_t k = 0; k < 6; k++)
+            float var[6] = { 0 };
+            var[0] = distribution_rpy(generator);
+            var[1] = distribution_rpy(generator);
+            var[2] = distribution_rpy(generator);
+            var[3] = distribution_xyz(generator);
+            var[4] = distribution_xyz(generator);
+            var[5] = distribution_xyz(generator);
+            Eigen::Matrix4f deltaT = Util::GetDeltaT(var);
+            float score;
+            if(!CalScore(is_left_multiply ? deltaT * extrinsic_ : extrinsic_ * deltaT, score, is_coarse)) continue;
+            #pragma omp critical
+            if(score > max_score_)
             {
-                bestVal[k] = var[k];
+                max_score_ = score;
+                for (size_t k = 0; k < 6; k++)
+                {
+                    bestVal[k] = var[k];
+                }
+                std::cout << "match score increase to: " << max_score_ << ", "
+                    << "val:" << bestVal[0] << " " << bestVal[1] << " " << bestVal[2]
+                    << " " << bestVal[3] << " " << bestVal[4] << " " << bestVal[5]
+                    << std::endl;
             }
-            std::cout << "match score increase to: " << max_score_ << ", "
-                      << "val:" << bestVal[0] << " " << bestVal[1] << " " << bestVal[2]
-                      << " " << bestVal[3] << " " << bestVal[4] << " " << bestVal[5]
-                      << std::endl;
         }
     }
     std::cout << "best val:" << bestVal[0] << " " << bestVal[1] << " " << bestVal[2] << " " << bestVal[3] << " "
               << bestVal[4] << " " << bestVal[5] << std::endl;
-    extrinsic_ *= Util::GetDeltaT(bestVal);
+    Eigen::Matrix4f deltaT = Util::GetDeltaT(bestVal);
+    extrinsic_ = is_left_multiply ? deltaT * extrinsic_ : extrinsic_ * deltaT;
 }
 
 void Calibrator::PrintCurrentError()

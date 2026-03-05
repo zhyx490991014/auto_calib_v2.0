@@ -8,7 +8,7 @@
 
 void SaveExtrinsic(Eigen::Matrix4f T)
 {
-    std::string file_name = "extrinsic.txt";
+    std::string file_name = "result/extrinsic.txt";
     
     std::ofstream ofs(file_name);
     if (!ofs.is_open())

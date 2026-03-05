@@ -42,14 +42,15 @@ public:
         const std::string error_file);
     void Calibrate();
     void ProcessPointcloud(const pcl::PointCloud<pcl::PointXYZI>::Ptr pc_origin);
+    pcl::PointCloud<pcl::PointXYZI>::Ptr DownsamplePointCloud(const pcl::PointCloud<pcl::PointXYZI>::Ptr pc_origin, float leaf_size);
     bool CalScore(Eigen::Matrix4f T, float& score, bool is_coarse);
     void VisualProjection(Eigen::Matrix4f T, std::string img_file, std::string save_name);
     void VisualProjectionSegment(Eigen::Matrix4f T, std::string img_file, std::string save_name);
     void Segment_pc(const pcl::PointCloud<pcl::PointXYZI>::Ptr pc_origin,
                     pcl::PointCloud<pcl::Normal>::Ptr normals,
                     std::vector<pcl::PointIndices>& seg_indices);
-    void BruteForceSearch(int rpy_range, float rpy_resolution,int xyz_range, float xyz_resolution, bool is_coarse);
-    void RandomSearch(int search_count, float xyz_range, float rpy_range, bool is_coarse);
+    void BruteForceSearch(int rpy_range, float rpy_resolution, int xyz_range, float xyz_resolution, bool is_coarse, const bool is_left_multiply = true);
+    void RandomSearch(int search_count, float xyz_range, float rpy_range, bool is_coarse, const bool is_left_multiply = true);
     bool ProjectOnImage(const Eigen::Vector4f &vec, const Eigen::Matrix4f &T, int &x, int &y, int margin);
     void PrintCurrentError();
     Eigen::Matrix4f GetFinalTransformation();

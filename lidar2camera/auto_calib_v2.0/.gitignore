@@ -1,0 +1,5 @@
+lib/*
+build/*
+bin/*
+data/*
+*.png
